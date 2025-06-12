@@ -5,7 +5,6 @@ const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const url = require('url');
 
-// --- Database In-Memory ---
 const users = JSON.parse(fs.readFileSync(path.join(__dirname, '../users.json')));
 const appointments = [
   {
@@ -13,20 +12,18 @@ const appointments = [
     doctorId: 'dokter1',
     patientId: 'pasien1',
     description: 'Konsultasi Rutin',
-    start: new Date(new Date().getTime() - 15 * 60000), // 15 menit lalu
-    end: new Date(new Date().getTime() + 60 * 60000),   // 1 jam dari sekarang
+    start: new Date(new Date().getTime() - 15 * 60000),
+    end: new Date(new Date().getTime() + 60 * 60000),
   }
 ];
 
-// Menyimpan koneksi klien berdasarkan roomId
-const rooms = {}; // { roomId: Set<Socket> }
+const rooms = {};
 
-// --- Membuat Server HTTP ---
 const server = http.createServer(async (req, res) => {
+  // ... (Bagian ini tidak berubah, biarkan seperti sebelumnya)
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
-  // --- Rute API ---
   if (pathname === '/api/login' && req.method === 'POST') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
@@ -54,16 +51,9 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(userAppointments));
     return;
   }
-
-  // --- Rute Penyajian File (HTML, JS) ---
-  const getContentType = (filePath) => {
-    if (filePath.endsWith('.html')) return 'text/html';
-    if (filePath.endsWith('.js')) return 'application/javascript';
-    return 'text/plain';
-  };
   
   let safePath;
-  if (pathname === '/') {
+  if (pathname === '/' || pathname === '/login.html') {
     safePath = path.join(__dirname, '../client/login.html');
   } else {
     safePath = path.join(__dirname, '../client', pathname);
@@ -74,14 +64,20 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(404);
       res.end('Not Found');
     } else {
+      const getContentType = (filePath) => {
+        if (filePath.endsWith('.html')) return 'text/html';
+        if (filePath.endsWith('.js')) return 'application/javascript';
+        return 'text/plain';
+      };
       res.writeHead(200, { 'Content-Type': getContentType(safePath) });
       res.end(data);
     }
   });
 });
 
-// --- Upgrade ke WebSocket ---
+
 server.on('upgrade', (req, socket, head) => {
+  // ... (Bagian handshake WebSocket tidak berubah)
   const key = req.headers['sec-websocket-key'];
   const acceptKey = crypto
     .createHash('sha1')
@@ -97,60 +93,123 @@ server.on('upgrade', (req, socket, head) => {
 
   let currentRoomId = null;
 
-  socket.on('data', (buffer) => {
-    const msg = parseMessage(buffer);
-    if (!msg) return;
+  // ==================== PERUBAHAN DIMULAI DI SINI ====================
 
-    try {
-      const data = JSON.parse(msg);
+  // Buffer untuk menampung data yang mungkin terpotong atau datang dalam satu paket
+  let inputBuffer = Buffer.alloc(0);
 
-      if (data.type === 'join') {
-        const { roomId, username } = data;
-        const appointment = appointments.find(a => a.id === roomId);
+  socket.on('data', (chunk) => {
+    inputBuffer = Buffer.concat([inputBuffer, chunk]); // Gabungkan data baru ke buffer
 
-        // Validasi Lengkap: Apakah janji temu ada, user berhak, dan waktunya pas?
-        if (!appointment || (username !== appointment.doctorId && username !== appointment.patientId) || new Date() < new Date(appointment.start) || new Date() > new Date(appointment.end)) {
-          socket.write(encodeMessage(JSON.stringify({ type: 'error', message: 'Sesi tidak valid atau tidak diizinkan.' })));
-          socket.end();
-          return;
-        }
+    // Terus proses selama buffer kita masih punya data untuk diproses
+    while (true) {
+      const result = processBuffer(inputBuffer);
 
-        // Jika valid, masukkan user ke room
-        currentRoomId = roomId;
-        if (!rooms[roomId]) rooms[roomId] = new Set();
-        rooms[roomId].add(socket);
-
-        console.log(`User ${username} joined room ${roomId}`);
-        // Kirim pesan ke user lain di room
-        rooms[roomId].forEach(client => {
-          if (client !== socket) {
-            client.write(encodeMessage(JSON.stringify({ type: 'user-joined', username })));
-          }
-        });
-      } else if (currentRoomId && rooms[currentRoomId]) {
-        // Broadcast pesan signaling (offer, answer, dll.) ke semua klien lain di room yang sama
-        rooms[currentRoomId].forEach(client => {
-          if (client !== socket) {
-            client.write(encodeMessage(JSON.stringify(data)));
-          }
-        });
+      if (!result) {
+        // Jika data tidak cukup untuk satu frame utuh, hentikan loop dan tunggu data berikutnya
+        break;
       }
-    } catch (e) {
-      console.error('Parsing error', e);
+
+      // Jika berhasil memproses satu frame
+      const frame = result.frame;
+      const msg = parseMessage(frame); // Gunakan fungsi parseMessage Anda yang lama
+      if (msg) {
+        handleMessage(JSON.parse(msg), socket); // Proses data JSON
+      }
+
+      // Buang bagian buffer yang sudah diproses
+      inputBuffer = result.remainingBuffer;
     }
   });
+  
+  function handleMessage(data, socket) {
+      try {
+        if (data.type === 'join') {
+            const { roomId, username } = data;
+            const appointment = appointments.find(a => a.id === roomId);
+
+            if (!appointment || (username !== appointment.doctorId && username !== appointment.patientId) || new Date() < new Date(appointment.start) || new Date() > new Date(appointment.end)) {
+                socket.write(encodeMessage(JSON.stringify({ type: 'error', message: 'Sesi tidak valid atau tidak diizinkan.' })));
+                socket.end();
+                return;
+            }
+
+            currentRoomId = roomId;
+            if (!rooms[roomId]) rooms[roomId] = new Set();
+            rooms[roomId].add(socket);
+            socket.roomId = roomId; // Simpan roomId di socket untuk proses 'close'
+
+            console.log(`User ${username} joined room ${roomId}`);
+            rooms[roomId].forEach(client => {
+                if (client !== socket) {
+                    client.write(encodeMessage(JSON.stringify({ type: 'user-joined', username })));
+                }
+            });
+        } else if (socket.roomId && rooms[socket.roomId]) {
+            rooms[socket.roomId].forEach(client => {
+                if (client !== socket) {
+                    client.write(encodeMessage(JSON.stringify(data)));
+                }
+            });
+        }
+      } catch (e) {
+          console.error("Error handling message:", e);
+      }
+  }
+
+  // Fungsi baru untuk memotong satu frame utuh dari buffer
+  function processBuffer(buffer) {
+    if (buffer.length < 2) return null; // Belum cukup data bahkan untuk header dasar
+
+    const lengthByte = buffer[1] & 127;
+    let payloadLength = lengthByte;
+    let headerLength = 2; // opcode (1) + length (1)
+    let maskOffset = 2;
+
+    if (lengthByte === 126) {
+      if (buffer.length < 4) return null; // Butuh 2 byte tambahan untuk panjang
+      payloadLength = buffer.readUInt16BE(2);
+      headerLength = 4;
+      maskOffset = 4;
+    } else if (lengthByte === 127) {
+      if (buffer.length < 10) return null; // Butuh 8 byte tambahan untuk panjang
+      payloadLength = Number(buffer.readBigUInt64BE(2)); // Mungkin perlu penyesuaian untuk pesan > 2GB
+      headerLength = 10;
+      maskOffset = 10;
+    }
+    
+    const maskKeyLength = 4;
+    const totalFrameLength = headerLength + maskKeyLength + payloadLength;
+
+    if (buffer.length < totalFrameLength) {
+      return null; // Data untuk satu frame penuh belum tiba
+    }
+
+    return {
+      frame: buffer.slice(0, totalFrameLength),
+      remainingBuffer: buffer.slice(totalFrameLength)
+    };
+  }
+
+  // ==================== PERUBAHAN SELESAI DI SINI ====================
+
 
   socket.on('end', () => {
     console.log('Client disconnected');
-    if (currentRoomId && rooms[currentRoomId]) {
-      rooms[currentRoomId].delete(socket);
+    // Gunakan roomId yang disimpan di socket
+    const roomId = socket.roomId; 
+    if (roomId && rooms[roomId]) {
+      rooms[roomId].delete(socket);
     }
+  });
+
+  socket.on('error', (err) => {
+    console.error("Socket error:", err.message);
   });
 });
 
-// --- Fungsi Helper WebSocket (dari kode asli Anda) ---
+// ... (Fungsi parseMessage dan encodeMessage Anda tidak berubah)
 function parseMessage(buffer) {
-  // ... (kode parseMessage Anda tidak perlu diubah)
   const secondByte = buffer[1];
   const length = secondByte & 127;
   let offset = 2;
@@ -166,7 +225,6 @@ function parseMessage(buffer) {
 }
 
 function encodeMessage(str) {
-  // ... (kode encodeMessage Anda tidak perlu diubah)
   const msg = Buffer.from(str);
   const length = msg.length;
   let header;
@@ -178,13 +236,13 @@ function encodeMessage(str) {
     header = Buffer.from([0x81, 126, (length >> 8) & 0xFF, length & 0xFF]);
     buffer = Buffer.concat([header, msg]);
   } else {
-    // Penanganan untuk pesan yang sangat besar (biasanya tidak diperlukan untuk signaling)
-    // ...
+    header = Buffer.from([0x81, 127, 0, 0, 0, 0, (length >> 24) & 0xFF, (length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF]);
+    buffer = Buffer.concat([header, msg]);
   }
   return buffer;
 }
 
-// --- Menjalankan Server ---
+
 server.listen(8080, () => {
   console.log('Server sederhana berjalan di http://localhost:8080');
 });
