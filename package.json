@@ -1,0 +1,14 @@
+{
+  "name": "telemedicine-app",
+  "version": "1.0.0",
+  "main": "server/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "express": "^5.1.0",
+    "ws": "^8.18.2"
+  }
+}

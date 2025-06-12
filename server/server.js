@@ -1,65 +1,87 @@
-// server/server.js
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const bcrypt = require('bcrypt');
+const url = require('url');
+
+// --- Database In-Memory ---
 const users = JSON.parse(fs.readFileSync(path.join(__dirname, '../users.json')));
-
-
-// Data janji temu (jadwal konsultasi)
 const appointments = [
   {
     id: 'room1',
-    start: new Date(new Date().getTime() - 5 * 60000), // 5 menit lalu
-    end: new Date(new Date().getTime() + 60 * 60000), // 1 jam dari sekarang
-  },
+    doctorId: 'dokter1',
+    patientId: 'pasien1',
+    description: 'Konsultasi Rutin',
+    start: new Date(new Date().getTime() - 15 * 60000), // 15 menit lalu
+    end: new Date(new Date().getTime() + 60 * 60000),   // 1 jam dari sekarang
+  }
 ];
 
-let clients = {}; // { roomId: [socket1, socket2, ...] }
+// Menyimpan koneksi klien berdasarkan roomId
+const rooms = {}; // { roomId: Set<Socket> }
 
-const server = http.createServer((req, res) => {
-  if (req.url === '/') {
-    fs.readFile(path.join(__dirname, '../client/index.html'), (err, data) => {
-      if (err) return res.writeHead(500).end('Error loading HTML');
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(data);
-    });
-  } else if (req.url === '/script.js') {
-    fs.readFile(path.join(__dirname, '../client/script.js'), (err, data) => {
-      if (err) return res.writeHead(500).end('Error loading JS');
-      res.writeHead(200, { 'Content-Type': 'application/javascript' });
-      res.end(data);
-    });
-  } else if (req.url === '/login' && req.method === 'POST') {
+// --- Membuat Server HTTP ---
+const server = http.createServer(async (req, res) => {
+  const parsedUrl = url.parse(req.url, true);
+  const pathname = parsedUrl.pathname;
+
+  // --- Rute API ---
+  if (pathname === '/api/login' && req.method === 'POST') {
     let body = '';
-    req.on('data', chunk => (body += chunk));
-    req.on('end', () => {
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
       const { username, password } = JSON.parse(body);
-      const user = users.find(u => u.username === username && u.password === password);
-      if (user) {
+      const user = users.find(u => u.username === username);
+
+      if (user && await bcrypt.compare(password, user.password)) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, user }));
+        res.end(JSON.stringify({ success: true, user: { username: user.username, role: user.role } }));
       } else {
         res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false }));
+        res.end(JSON.stringify({ success: false, message: 'Username atau password salah' }));
       }
     });
-  } else if (req.url === '/login.html') {
-    fs.readFile(path.join(__dirname, '../client/login.html'), (err, data) => {
-      if (err) return res.writeHead(500).end('Error loading login page');
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(data);
-    });
-  } else if (req.url === '/login.js') {
-    fs.readFile(path.join(__dirname, '../client/login.js'), (err, data) => {
-      if (err) return res.writeHead(500).end('Error loading login script');
-      res.writeHead(200, { 'Content-Type': 'application/javascript' });
-      res.end(data);
-    });
+    return;
   }
+
+  if (pathname === '/api/appointments' && req.method === 'GET') {
+    const { username } = parsedUrl.query;
+    const userAppointments = appointments.filter(
+      apt => apt.doctorId === username || apt.patientId === username
+    );
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(userAppointments));
+    return;
+  }
+
+  // --- Rute Penyajian File (HTML, JS) ---
+  const getContentType = (filePath) => {
+    if (filePath.endsWith('.html')) return 'text/html';
+    if (filePath.endsWith('.js')) return 'application/javascript';
+    return 'text/plain';
+  };
+  
+  let safePath;
+  if (pathname === '/') {
+    safePath = path.join(__dirname, '../client/login.html');
+  } else {
+    safePath = path.join(__dirname, '../client', pathname);
+  }
+
+  fs.readFile(safePath, (err, data) => {
+    if (err) {
+      res.writeHead(404);
+      res.end('Not Found');
+    } else {
+      res.writeHead(200, { 'Content-Type': getContentType(safePath) });
+      res.end(data);
+    }
+  });
 });
 
-server.on('upgrade', (req, socket) => {
+// --- Upgrade ke WebSocket ---
+server.on('upgrade', (req, socket, head) => {
   const key = req.headers['sec-websocket-key'];
   const acceptKey = crypto
     .createHash('sha1')
@@ -73,7 +95,7 @@ server.on('upgrade', (req, socket) => {
     `Sec-WebSocket-Accept: ${acceptKey}\r\n\r\n`
   );
 
-  let roomId = null;
+  let currentRoomId = null;
 
   socket.on('data', (buffer) => {
     const msg = parseMessage(buffer);
@@ -83,27 +105,35 @@ server.on('upgrade', (req, socket) => {
       const data = JSON.parse(msg);
 
       if (data.type === 'join') {
-        roomId = data.roomId;
-        const appointment = appointments.find(
-          (a) => a.id === roomId && new Date() >= a.start && new Date() <= a.end
-        );
+        const { roomId, username } = data;
+        const appointment = appointments.find(a => a.id === roomId);
 
-        if (!appointment) {
-          socket.write(encodeMessage(JSON.stringify({ type: 'error', message: 'Janji tidak aktif' })));
+        // Validasi Lengkap: Apakah janji temu ada, user berhak, dan waktunya pas?
+        if (!appointment || (username !== appointment.doctorId && username !== appointment.patientId) || new Date() < new Date(appointment.start) || new Date() > new Date(appointment.end)) {
+          socket.write(encodeMessage(JSON.stringify({ type: 'error', message: 'Sesi tidak valid atau tidak diizinkan.' })));
           socket.end();
           return;
         }
 
-        if (!clients[roomId]) clients[roomId] = [];
-        clients[roomId].push(socket);
-      } else {
-        if (roomId && clients[roomId]) {
-          clients[roomId].forEach((client) => {
-            if (client !== socket) {
-              client.write(encodeMessage(JSON.stringify(data)));
-            }
-          });
-        }
+        // Jika valid, masukkan user ke room
+        currentRoomId = roomId;
+        if (!rooms[roomId]) rooms[roomId] = new Set();
+        rooms[roomId].add(socket);
+
+        console.log(`User ${username} joined room ${roomId}`);
+        // Kirim pesan ke user lain di room
+        rooms[roomId].forEach(client => {
+          if (client !== socket) {
+            client.write(encodeMessage(JSON.stringify({ type: 'user-joined', username })));
+          }
+        });
+      } else if (currentRoomId && rooms[currentRoomId]) {
+        // Broadcast pesan signaling (offer, answer, dll.) ke semua klien lain di room yang sama
+        rooms[currentRoomId].forEach(client => {
+          if (client !== socket) {
+            client.write(encodeMessage(JSON.stringify(data)));
+          }
+        });
       }
     } catch (e) {
       console.error('Parsing error', e);
@@ -111,31 +141,50 @@ server.on('upgrade', (req, socket) => {
   });
 
   socket.on('end', () => {
-    if (roomId && clients[roomId]) {
-      clients[roomId] = clients[roomId].filter((s) => s !== socket);
+    console.log('Client disconnected');
+    if (currentRoomId && rooms[currentRoomId]) {
+      rooms[currentRoomId].delete(socket);
     }
   });
 });
 
+// --- Fungsi Helper WebSocket (dari kode asli Anda) ---
 function parseMessage(buffer) {
+  // ... (kode parseMessage Anda tidak perlu diubah)
   const secondByte = buffer[1];
   const length = secondByte & 127;
-  const maskingKey = buffer.slice(2, 6);
-  const data = buffer.slice(6, 6 + length);
+  let offset = 2;
+  if (length === 126) {
+    offset = 4;
+  } else if (length === 127) {
+    offset = 10;
+  }
+  const maskingKey = buffer.slice(offset, offset + 4);
+  const data = buffer.slice(offset + 4);
   const decoded = data.map((byte, i) => byte ^ maskingKey[i % 4]);
   return Buffer.from(decoded).toString('utf8');
 }
 
 function encodeMessage(str) {
+  // ... (kode encodeMessage Anda tidak perlu diubah)
   const msg = Buffer.from(str);
   const length = msg.length;
-  const buffer = Buffer.alloc(2 + length);
-  buffer[0] = 0x81; // FIN + text frame
-  buffer[1] = length;
-  msg.copy(buffer, 2);
+  let header;
+  let buffer;
+  if (length <= 125) {
+    header = Buffer.from([0x81, length]);
+    buffer = Buffer.concat([header, msg]);
+  } else if (length <= 65535) {
+    header = Buffer.from([0x81, 126, (length >> 8) & 0xFF, length & 0xFF]);
+    buffer = Buffer.concat([header, msg]);
+  } else {
+    // Penanganan untuk pesan yang sangat besar (biasanya tidak diperlukan untuk signaling)
+    // ...
+  }
   return buffer;
 }
 
+// --- Menjalankan Server ---
 server.listen(8080, () => {
-  console.log('Server running at http://localhost:8080');
+  console.log('Server sederhana berjalan di http://localhost:8080');
 });

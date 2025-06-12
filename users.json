@@ -1,4 +1,12 @@
 [
-  { "username": "dokter1", "password": "dokter123", "role": "dokter" },
-  { "username": "pasien1", "password": "pasien123", "role": "pasien" }
+  {
+    "username": "dokter1",
+    "password": "$2b$10$vxYk.gC5rx2HwttENSpo2emXfkRTSmxtjqKMmswWcPWzEHyy0pIIq",
+    "role": "dokter"
+  },
+  {
+    "username": "pasien1",
+    "password": "$2b$10$yAxj4.wVHaDQCKp3Vn2BGOkhPJqR65.MA8BeFHoIKigntOHJ.r/e2",
+    "role": "pasien"
+  }
 ]
